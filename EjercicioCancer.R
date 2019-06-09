@@ -1,4 +1,4 @@
-
+﻿
 install.packages("data.table")
 
 #-------------------------------------------------#
@@ -8,7 +8,7 @@ install.packages("data.table")
 library(data.table)
 
 getwd()
-setwd("C:/Compensar")
+setwd("C:/base")
 
 str(X1cancer)
 table(X1cancer$diagnosis)
