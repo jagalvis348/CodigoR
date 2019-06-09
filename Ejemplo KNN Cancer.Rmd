@@ -1,0 +1,393 @@
+---
+title: "KNN"
+output:
+  html_document:
+    df_print: paged
+---
+
+#Información preliminar#
+
+Para este ejercicio, usaremos el paquete caret para hacer el modelado y la predicción de kNN, el paquete pander para poder generar tablas bien formadas y el doMC para aprovechar el procesamiento paralelo con múltiples núcleos. Además, definiremos algunas funciones de utilidad para simplificar asuntos más adelante en el código.
+
+
+```{r}
+uciurl <- "https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wdbc.data"
+download.file(url=uciurl, destfile="wdbc.data", method="curl")
+wdbc <- read.csv("wdbc.data", header=FALSE, stringsAsFactors=FALSE)[-1]
+wdbc <- wdbc[sample(nrow(wdbc)),]
+features <- c("radius", "texture", "perimeter", "area", "smoothness", 
+              "compactness", "concavity", "concave_points", "symmetry",
+              "fractal_dimension")
+calcs <- c("mean", "se", "worst")
+colnames(wdbc) <- c("diagnosis",
+                    paste0(rep(features, 3), "_", rep(calcs, each=10)))
+```
+
+
+```{r}
+
+#install.packages("doMC", repos="http://R-Forge.R-project.org")
+
+library(ggplot2)
+library(caret)
+library(pander)
+
+require(doMC)
+
+#library(doMC)
+
+registerDoMC(cores=4)
+
+# una función de utilidad para tablas% freq
+frqtab <- function(x, caption) {
+    round(100*prop.table(table(x)), 1)
+}
+
+# función de utilidad para redondear los valores en una lista
+# pero solo si son numéricos
+round_numeric <- function(lst, decimals=2) {
+    lapply(lst, function(x) {
+        if (is.numeric(x)) {
+            x <- round(x, decimals)
+        }
+        x
+        })
+}
+
+# función de utilidad para resumir los resultados de comparación del modelo
+summod <- function(cm, fit) {
+    summ <- list(k=fit$finalModel$k,
+                 metric=fit$metric,
+                 value=fit$results[fit$results$k == fit$finalModel$k, fit$metric],
+                 TN=cm$table[1,1],  # verdaderos negativos
+                 TP=cm$table[2,2],  # verdaderos positivos
+                 FN=cm$table[1,2],  # falsos negativos
+                 FP=cm$table[2,1],  # falsos positivos
+                 acc=cm$overall["Accuracy"],  # exactitud
+                 sens=cm$byClass["Sensitivity"],  # sensibilidad
+                 spec=cm$byClass["Specificity"],  # especificidad
+                 PPV=cm$byClass["Pos Pred Value"], # valor predictivo positivo
+                 NPV=cm$byClass["Neg Pred Value"]) # nevalor predictivo negativo
+    round_numeric(summ)
+}
+```
+
+
+#Lectura y preparación de los datos.#
+
+Como la primera columna en el archivo CSV original contiene solo una identificación, que no usaremos, leemos el csv y lo eliminamos antes de asignarlo a un marco de datos.
+
+Además, convertiremos el diagnóstico en un factor, de manera similar al ejemplo del libro.
+
+
+```{r}
+
+# Recodificar el diagnóstico como un factor, como se hace en el ejemplo del libro.
+
+wdbc$diagnosis <- factor(wdbc$diagnosis, levels = c("B", "M"),
+                         labels = c("Benigno", "Maligno"))
+str(wdbc)
+```
+
+
+Solo para tener una medida base, echemos un vistazo a las frecuencias para el diagnóstico
+
+
+```{r}
+library(pander)
+
+ft_orig <- frqtab(wdbc$diagnosis)
+pander(ft_orig, style="rmarkdown", caption="Frecuencias de diagnostico originales (%)")
+
+```
+
+
+#Usando la precisión como métrica#
+
+En el libro, las primeras 469 filas se asignan al conjunto de entrenamiento, y el resto al conjunto de prueba (Nota: estoy usando el conjunto de datos modificado del libro, si uso los datos originales de UCI, sus resultados podrían ser diferentes)
+
+```{r}
+wdbc_train <- wdbc[1:469,]
+wdbc_test <- wdbc[470:569,]
+```
+
+
+Solo para completar, verifiquemos si esa estrategia de partición de datos nos brinda conjuntos con distribuciones similares a las de los datos originales.
+
+```{r}
+ft_train <- frqtab(wdbc_train$diagnosis)
+ft_test <- frqtab(wdbc_test$diagnosis)
+ftcmp_df <- as.data.frame(cbind(ft_orig, ft_train, ft_test))
+colnames(ftcmp_df) <- c("Original", "Set entrenamiento", "Set prueba")
+pander(ftcmp_df, style="rmarkdown",
+             caption="Comparación de frecuencias de diagnóstico (en%)")
+```
+
+Las frecuencias de diagnóstico en el conjunto de entrenamiento se parecen mucho a los datos originales, pero el conjunto de prueba contiene un poco más de diagnóstico maligno a propósito.
+
+A pesar de esta disparidad, intentemos utilizar kNN5 en los conjuntos. Usaremos la validación cruzada repetida y escalaremos los datos utilizando el método de rango.
+
+El ejemplo en el libro hace el modelado en varios valores discretos de k, aquí caret proporciona los medios para hacer esa optimización automáticamente utilizando una métrica de selección para decidir qué modelo es óptimo. Usaremos la precisión como la métrica.
+
+
+
+```{r}
+library(e1071)
+ctrl <- trainControl(method="repeatedcv", number=10, repeats=3)
+set.seed(12345)
+knnFit1 <- train(diagnosis ~ ., data=wdbc_train, method="knn",
+                trControl=ctrl, metric="Accuracy", tuneLength=20,
+                preProc=c("range"))
+knnFit1
+```
+
+
+
+
+```{r}
+plot(knnFit1)
+```
+
+
+Como podemos ver en los resultados y la gráfica, al usar la métrica de precisión y la partición de datos del libro, el mejor modelo es el que tiene k = 13.
+
+Usemos este modelo para predecir el diagnóstico en el conjunto de pruebas y luego calculemos la matriz de confusión correspondiente:
+
+```{r}
+knnPredict1 <- predict(knnFit1, newdata=wdbc_test)
+cmat1 <- confusionMatrix(knnPredict1, wdbc_test$diagnosis, positive="Maligno")
+cmat1
+```
+
+
+#Usando kappa como métrica#
+Averigüemos si el modelo cambia si usamos la misma partición de datos, pero esta vez usamos kappa como la métrica de selección del modelo.
+
+
+```{r}
+knnFit2 <- train(diagnosis ~ ., data=wdbc_train, method="knn",
+                trControl=ctrl, metric="Kappa", tuneLength=20,
+                preProc=c("range"))
+knnFit2
+```
+
+
+
+```{r}
+plot(knnFit2)
+```
+
+
+```{r}
+knnPredict2 <- predict(knnFit2, newdata=wdbc_test)
+cmat2 <- confusionMatrix(knnPredict2, wdbc_test$diagnosis, positive="Maligno")
+cmat2
+```
+
+Ahora, en lugar de un k = 13 del primer modelo, tenemos un k = 9 cuando usamos kappa.
+
+#Usando ROC como métrica#
+
+Finalmente, consideremos usar la métrica ROC, para eso necesitamos cambiar los parámetros de control:
+
+
+```{r}
+ctrl <- trainControl(method="repeatedcv", number=10, repeats=3,
+                     classProbs=TRUE, summaryFunction=twoClassSummary)
+knnFit3 <- train(diagnosis ~ ., data=wdbc_train, method="knn",
+                trControl=ctrl, metric="ROC", tuneLength=30,
+                preProc=c("range"))
+knnFit3
+```
+
+
+```{r}
+plot(knnFit3)
+```
+
+
+
+
+
+```{r}
+knnPredict3 <- predict(knnFit3, newdata=wdbc_test)
+cmat3 <- confusionMatrix(knnPredict3, wdbc_test$diagnosis, positive="Maligno")
+cmat3
+```
+
+
+Para la métrica ROC, el mejor modelo es para k = 11.
+
+#Comparando los tres modelos.#
+
+Solo para tener una comprensión clara de las diferencias entre los tres modelos de kNN, los resumiremos en una tabla. También incluiremos los datos del ejemplo del libro.
+
+```{r}
+# from the book's table in page 83
+tn=61
+tp=37
+fn=2
+fp=0
+book_example <- list(
+    k=21,
+    metric=NA,
+    value=NA,
+    TN=tn,
+    TP=tp,
+    FN=fn,
+    FP=fp,
+    acc=(tp + tn)/(tp + tn + fp + fn),
+    sens=tp/(tp + fn),
+    spec=tn/(tn + fp),
+    PPV=tp/(tp + fp),
+    NPV=tn/(tn + fn))
+
+model_comp <- as.data.frame(
+    rbind(round_numeric(book_example),
+          summod(cmat1, knnFit1),
+          summod(cmat2, knnFit2),
+          summod(cmat3, knnFit3)))
+rownames(model_comp) <- c("Book model", "Model 1", "Model 2", "Model 3")
+pander(model_comp[,-3], split.tables=Inf, keep.trailing.zeros=TRUE,
+       style="rmarkdown",
+       caption="Resultados del modelo al comparar predicciones y conjunto de pruebas")
+```
+
+
+El modelo del libro que usa 21 vecinos es un poco mejor en precisión, sensibilidad y VAN. Por lo tanto, tiende a cometer menos errores de Tipo II que los otros modelos. Por otro lado, utiliza casi el doble de vecinos que cualquiera de los modelos estimados utilizando caret.
+
+En general, parece que, con caret y en este caso particular, es casi lo mismo si usamos Accuracy o ROC como la métrica de selección, ya que ambos dan resultados similares.
+
+
+
+#Cambiando la estrategia de partición de datos#
+Una pregunta sigue siendo si una estrategia de partición diferente mejorará o no los modelos de intercalación. Así que probaremos tres estrategias de partición de datos diferentes utilizando la métrica de precisión.
+
+Elegiremos las siguientes particiones de datos (proporción de entrenamiento: casos de prueba):
+
+Modelo A: 469: 100 (la proporción utilizada en el libro)
+Modelo B: 1: 1 (50% de entrenamiento, 50% de prueba)
+Modelo C: 9: 1 (90% de entrenamiento, 10% de prueba)
+
+#Usando las proporciones del libro.#
+Usaremos la proporción de 469: 100 para dividir los datos (~ 82.425% de las filas para entrenamiento) tratando de mantener las proporciones de diagnóstico similares en todos los conjuntos. Para mostrar que esta última condición se mantiene, compararemos las proporciones de diagnóstico en los conjuntos de datos originales, de entrenamiento y de prueba.
+
+
+
+```{r}
+set.seed(12345)
+ptr <- 469/569
+train_index <- createDataPartition(wdbc$diagnosis, p=ptr, list=FALSE)
+wdbc_train <- wdbc[train_index,]
+wdbc_test <- wdbc[-train_index,]
+ft_train <- frqtab(wdbc_train$diagnosis)
+ft_test <- frqtab(wdbc_test$diagnosis)
+ft_df <- as.data.frame(cbind(ft_orig, ft_train, ft_test))
+colnames(ft_df) <- c("Original", "Training set", "Test set")
+pander(ft_df, style="rmarkdown",
+       caption=paste0("Comparison of diagnosis frequencies for prop(train)=",
+                      round(ptr*100, 2),"%"))
+```
+
+
+Ahora calculemos el modelo usando Precisión como métrica de selección:
+
+```{r}
+ctrl <- trainControl(method="repeatedcv", number=10, repeats=3)
+set.seed(12345)
+knnFitA <- train(diagnosis ~ ., data=wdbc_train, method="knn",
+                trControl=ctrl, metric="Accuracy", tuneLength=20,
+                preProc=c("range"))
+plot(knnFitA)
+```
+
+```{r}
+knnPredictA <- predict(knnFitA, newdata=wdbc_test)
+cmatA <- confusionMatrix(knnPredictA, wdbc_test$diagnosis, positive="Maligno")
+cmatA
+
+```
+
+
+Esta vez tenemos un número o vecinos diferentes (k = 7), pero nuestra precisión no es tan buena (0,96) y también la sensibilidad ha disminuido (0,89) porque tenemos más falsos negativos.
+
+#Usando el entrenamiento 1: 1: proporción de prueba#
+
+```{r}
+set.seed(12345)
+ptr <- .5
+train_index <- createDataPartition(wdbc$diagnosis, p=ptr, list=FALSE)
+wdbc_train <- wdbc[train_index,]
+wdbc_test <- wdbc[-train_index,]
+set.seed(12345)
+knnFitB <- train(diagnosis ~ ., data=wdbc_train, method="knn",
+                trControl=ctrl, metric="Accuracy", tuneLength=20,
+                preProc=c("range"))
+knnPredictB <- predict(knnFitB, newdata=wdbc_test)
+cmatB <- confusionMatrix(knnPredictB, wdbc_test$diagnosis, positive="Maligno")
+cmatB
+```
+
+
+Utilizando el 50% de los casos para entrenamiento, nos da un modelo que usa k = 9 vecinos más cercanos, con una precisión de 0.97 y una sensibilidad de 0.96
+
+#Usando el entrenamiento 9: 1: proporción de prueba#
+
+```{r}
+set.seed(12345)
+ptr <- .9
+train_index <- createDataPartition(wdbc$diagnosis, p=ptr, list=FALSE)
+wdbc_train <- wdbc[train_index,]
+wdbc_test <- wdbc[-train_index,]
+set.seed(12345)
+knnFitC <- train(diagnosis ~ ., data=wdbc_train, method="knn",
+                trControl=ctrl, metric="Accuracy", tuneLength=20,
+                preProc=c("range"))
+knnPredictC <- predict(knnFitC, newdata=wdbc_test)
+cmatC <- confusionMatrix(knnPredictC, wdbc_test$diagnosis, positive="Maligno")
+cmatC
+```
+
+
+Utilizando el 90% de los casos para entrenamiento, nos da un modelo que usa k = 5 vecinos más cercanos, con una precisión de 0.95 y una sensibilidad de 0.86
+
+
+#Comparando los modelos de diferentes estrategias de partición.#
+Como hemos usado la misma semilla aleatoria para todos los modelos, podemos compararlos en igualdad de condiciones.
+
+Vamos a comparar:
+
+Modelo 1
+Los datos se dividieron usando las primeras 469 filas para entrenamiento y las otras 100 filas para probar
+
+Modelo A
+Los datos se dividieron usando la misma proporción de 469: 100, pero tratando de mantener una distribución de diagnósticos similar al conjunto completo de datos en los conjuntos de entrenamiento y pruebas.
+
+Modelo B
+Los datos se dividieron en 50% para la capacitación y 50% para las pruebas, y se trató de mantener la misma distribución de diagnósticos en el conjunto de capacitación y pruebas que los datos originales.
+
+Modelo c
+Los datos se dividieron en un 90% para el entrenamiento y un 10% para las pruebas, mientras se trataba de mantener la misma distribución de diagnósticos en el conjunto de entrenamiento y pruebas que los datos originales.
+
+```{r}
+model_comp <- data.frame(
+    rbind(
+        summod(cmat1, knnFit1),
+        summod(cmatA, knnFitA),
+        summod(cmatB, knnFitB),
+        summod(cmatC, knnFitC)
+        )
+    )
+rownames(model_comp) <- c("Model 1", "Model A", "Model B", "Model C")
+pander(model_comp[,-c(2,3)], split.tables=Inf, keep.trailing.zeros=TRUE,
+       style="rmarkdown",
+       caption="Comparación de modelos utilizando diferentes proporciones de partición de datos")
+```
+
+
+Al comparar el Modelo 1 y el Modelo A, encontramos que el uso de una proporción equilibrada de diagnósticos en los conjuntos de pruebas y entrenamiento, tiene el efecto de reducir el número de vecinos más cercanos a casi la mitad (de 13 a 7), pero también impacta ligeramente la precisión, y las medidas relacionadas de sensibilidad y VAN.
+
+El uso de un entrenamiento 1: 1: proporción de prueba (Modelo B), proporciona una precisión y sensibilidad ligeramente mejores, pero a costa de disminuir la especificidad. Esto podría ser una buena compensación en este caso, tener menos falsos negativos salvará más vidas, lo que compensa con creces la ocurrencia de algunos falsos positivos más.
+
+Finalmente, usar el 90% para entrenamiento y el 10% para pruebas no solo reduce el número de vecinos más cercanos necesarios en el modelo, sino que también aumenta la proporción de falsos negativos, disminuyendo su sensibilidad y el VAN.
+
